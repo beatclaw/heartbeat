@@ -13,6 +13,7 @@ import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
 import { getCliBuilder, type CliBuilder } from './cli.js'
 import { wrapWithSandbox, type SandboxConfig } from './sandbox.js'
+import { loadTodos, addTodo, updateTodo, getNextTodo, clearDone, recoverStuck } from './todos.js'
 
 // === Config ===
 
@@ -57,7 +58,7 @@ const CROSS_CONTEXT_MAX_CHARS = 500
 
 function loadConfig(): Config {
   if (!existsSync(CONFIG_PATH)) {
-    console.error('config.yaml not found. Run "npx beatclaw" to set up.')
+    console.error('config.yaml not found. Run "npx @beatclaw/heartbeat" to set up.')
     process.exit(1)
   }
   const raw = parseYaml(readFileSync(CONFIG_PATH, 'utf-8')) as Config
@@ -138,6 +139,38 @@ bot.command('ping', async (ctx) => {
   await ctx.reply('pong')
 })
 
+bot.command('todo', async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  const text = ctx.match?.trim()
+  if (!text) {
+    await ctx.reply('Usage: /todo <task description>')
+    return
+  }
+  const todo = addTodo(DATA_DIR, { title: text, source: 'user', priority: 'medium' })
+  await ctx.reply(`Added: ${todo.title} (${todo.id.slice(0, 8)})`)
+})
+
+bot.command('todos', async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  const todos = loadTodos(DATA_DIR)
+  const active = todos.filter(t => t.status === 'pending' || t.status === 'in_progress')
+  if (active.length === 0) {
+    await ctx.reply('No pending tasks.')
+    return
+  }
+  const lines = active.map(t => {
+    const icon = t.status === 'in_progress' ? '🔄' : '⏳'
+    return `${icon} ${t.title} (${t.priority})`
+  })
+  await ctx.reply(lines.join('\n'))
+})
+
+bot.command('clear', async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  const removed = clearDone(DATA_DIR)
+  await ctx.reply(`Cleared ${removed} completed/failed tasks.`)
+})
+
 bot.on('message:text', async (ctx) => {
   if (!ctx.from || !isAllowed(ctx.from.id)) return
 
@@ -192,41 +225,75 @@ async function sendFinalMessage(chatId: number, text: string): Promise<void> {
 
 // === MCP SSE Server ===
 
-const mcpServer = new McpServer({ name: 'beatclaw', version: '0.1.0' })
+function createMcpServer(): McpServer {
+  const server = new McpServer({ name: 'heartbeat', version: '0.1.0' })
 
-mcpServer.tool('telegram_read', 'Read new Telegram messages', {}, async () => {
-  const messages = messageBuffer
-  // Persist before clearing (crash safety)
-  saveJson('pending_messages.json', messages)
-  messageBuffer = []
-  return { content: [{ type: 'text', text: JSON.stringify(messages) }] }
-})
+  server.tool('telegram_read', 'Read new Telegram messages', {}, async () => {
+    const messages = messageBuffer
+    saveJson('pending_messages.json', messages)
+    messageBuffer = []
+    return { content: [{ type: 'text', text: JSON.stringify(messages) }] }
+  })
 
-mcpServer.tool(
-  'telegram_send',
-  'Send a message to Telegram',
-  { text: z.string(), chat_id: z.number().optional() },
-  async ({ text, chat_id }) => {
-    const targetChat = chat_id ?? config.telegram.default_chat_id
-    await sendFinalMessage(targetChat, text)
-    return { content: [{ type: 'text', text: 'Sent.' }] }
-  }
-)
-
-mcpServer.tool('heartbeat_check', 'Run health checks and return results', {}, async () => {
-  const results: { command: string; output: string }[] = []
-  for (const cmd of config.heartbeat.checks) {
-    try {
-      const output = await execShell(cmd, config.agent.cwd)
-      if (output.trim()) {
-        results.push({ command: cmd, output: output.trim() })
-      }
-    } catch (err) {
-      results.push({ command: cmd, output: `Error: ${(err as Error).message}` })
+  server.tool(
+    'telegram_send',
+    'Send a message to Telegram',
+    { text: z.string(), chat_id: z.number().optional() },
+    async ({ text, chat_id }) => {
+      const targetChat = chat_id ?? config.telegram.default_chat_id
+      await sendFinalMessage(targetChat, text)
+      return { content: [{ type: 'text', text: 'Sent.' }] }
     }
-  }
-  return { content: [{ type: 'text', text: JSON.stringify(results) }] }
-})
+  )
+
+  server.tool(
+    'todo_list',
+    'List todo items, optionally filtered by status',
+    { status: z.string().optional() },
+    async ({ status }) => {
+      const todos = loadTodos(DATA_DIR)
+      const filtered = status ? todos.filter(t => t.status === status) : todos
+      return { content: [{ type: 'text', text: JSON.stringify(filtered) }] }
+    }
+  )
+
+  server.tool(
+    'todo_add',
+    'Add a new todo item',
+    { title: z.string(), description: z.string().optional(), priority: z.enum(['high', 'medium', 'low']).optional() },
+    async ({ title, description, priority }) => {
+      const todo = addTodo(DATA_DIR, { title, description, priority, source: 'agent' })
+      return { content: [{ type: 'text', text: JSON.stringify(todo) }] }
+    }
+  )
+
+  server.tool(
+    'todo_update',
+    'Update a todo item status',
+    { id: z.string(), status: z.enum(['pending', 'in_progress', 'done', 'failed']), result: z.string().optional() },
+    async ({ id, status, result }) => {
+      const todo = updateTodo(DATA_DIR, id, { status, result })
+      return { content: [{ type: 'text', text: JSON.stringify(todo) }] }
+    }
+  )
+
+  server.tool('heartbeat_check', 'Run health checks and return results', {}, async () => {
+    const results: { command: string; output: string }[] = []
+    for (const cmd of config.heartbeat.checks) {
+      try {
+        const output = await execShell(cmd, config.agent.cwd)
+        if (output.trim()) {
+          results.push({ command: cmd, output: output.trim() })
+        }
+      } catch (err) {
+        results.push({ command: cmd, output: `Error: ${(err as Error).message}` })
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(results) }] }
+  })
+
+  return server
+}
 
 function execShell(cmd: string, cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -239,7 +306,7 @@ function execShell(cmd: string, cwd: string): Promise<string> {
 
 // SSE transport with bearer token auth
 function startMcpServer(): void {
-  const transports = new Map<string, SSEServerTransport>()
+  const sessions = new Map<string, { transport: SSEServerTransport; server: McpServer }>()
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     // Bearer token auth
@@ -253,22 +320,26 @@ function startMcpServer(): void {
     const url = new URL(req.url ?? '/', `http://localhost:${config.mcp.port}`)
 
     if (url.pathname === '/sse') {
+      const server = createMcpServer()
       const transport = new SSEServerTransport('/messages', res)
-      transports.set(transport.sessionId, transport)
-      res.on('close', () => transports.delete(transport.sessionId))
-      await mcpServer.connect(transport)
+      sessions.set(transport.sessionId, { transport, server })
+      res.on('close', () => {
+        sessions.delete(transport.sessionId)
+        server.close().catch(() => {})
+      })
+      await server.connect(transport)
       return
     }
 
     if (url.pathname === '/messages' && req.method === 'POST') {
       const sessionId = url.searchParams.get('sessionId')
-      const transport = sessionId ? transports.get(sessionId) : undefined
-      if (!transport) {
+      const session = sessionId ? sessions.get(sessionId) : undefined
+      if (!session) {
         res.writeHead(404)
         res.end('Session not found')
         return
       }
-      await transport.handlePostMessage(req, res)
+      await session.transport.handlePostMessage(req, res)
       return
     }
 
@@ -278,6 +349,54 @@ function startMcpServer(): void {
 
   httpServer.listen(config.mcp.port, '127.0.0.1', () => {
     console.log(`[mcp] SSE server listening on 127.0.0.1:${config.mcp.port}`)
+  })
+}
+
+// === CLI Process Runner ===
+
+interface CliCallbacks {
+  onStdout(str: string): void
+}
+
+function runCliProcess(
+  sandboxed: { command: string; args: string[]; cleanup?: () => void },
+  cwd: string,
+  timeout: number,
+  callbacks: CliCallbacks
+): Promise<number> {
+  return new Promise((resolve) => {
+    const cleanEnv = { ...process.env }
+    delete cleanEnv.CLAUDECODE
+
+    const child: ChildProcess = spawn(
+      sandboxed.command,
+      sandboxed.args,
+      { cwd, env: cleanEnv, stdio: ['ignore', 'pipe', 'pipe'] }
+    )
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      callbacks.onStdout(chunk.toString())
+    })
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      console.error(`[cli] stderr: ${chunk.toString().slice(0, 500)}`)
+    })
+
+    child.on('error', (err) => {
+      console.error(`[cli] spawn error:`, err.message)
+      resolve(1)
+    })
+
+    child.on('exit', (code) => resolve(code ?? 0))
+
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM')
+      setTimeout(() => {
+        if (!child.killed) child.kill('SIGKILL')
+      }, 5000)
+    }, timeout)
+
+    child.on('exit', () => clearTimeout(timer))
   })
 }
 
@@ -331,63 +450,52 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   const throttle = config.streaming.throttle
 
   try {
-    await new Promise<number>((resolvePromise) => {
-      // Strip CLAUDECODE env var to avoid nested-session detection
-      const cleanEnv = { ...process.env }
-      delete cleanEnv.CLAUDECODE
-
-      const child: ChildProcess = spawn(
-        sandboxed.command,
-        sandboxed.args,
-        { cwd: config.agent.cwd, env: cleanEnv, stdio: ['ignore', 'pipe', 'pipe'] }
-      )
-
-      child.stdout?.on('data', (chunk: Buffer) => {
-        const str = chunk.toString()
-
-        // Extract session ID early (only once)
+    const exitCode = await runCliProcess(sandboxed, config.agent.cwd, config.agent.timeout, {
+      onStdout(str) {
         if (!capturedSessionId) {
           capturedSessionId = cliBuilder.parseSessionId(str)
         }
-
         const text = cliBuilder.extractText(str)
         if (!text) return
-
         accumulated += text
         const now = Date.now()
         if (now - lastDraftTime >= throttle) {
           lastDraftTime = now
           sendDraft(targetChat, draftId, accumulated).catch(() => {})
         }
-      })
-
-      child.stderr?.on('data', (chunk: Buffer) => {
-        console.error(`[cli] stderr: ${chunk.toString().slice(0, 500)}`)
-      })
-
-      child.on('error', (err) => {
-        console.error(`[cli] spawn error:`, err.message)
-        resolvePromise(1)
-      })
-
-      child.on('exit', (code) => {
-        resolvePromise(code ?? 0)
-      })
-
-      // Graceful timeout: SIGTERM then SIGKILL
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM')
-        setTimeout(() => {
-          if (!child.killed) child.kill('SIGKILL')
-        }, 5000)
-      }, config.agent.timeout)
-
-      child.on('exit', () => clearTimeout(timer))
+      },
     })
 
-    // Update session immutably
+    // Continue failed → retry once as fresh session
+    if (exitCode !== 0 && currentSession.id) {
+      console.error(`[cli] Continue failed (exit ${exitCode}), retrying as fresh session`)
+      accumulated = ''
+      capturedSessionId = null
+      const freshArgs = cliBuilder.buildArgs(null, prompt)
+      const freshSandboxed = wrapWithSandbox(
+        cliBuilder.command, freshArgs, config.sandbox, config.agent.cwd, config.agent.cli
+      )
+      await runCliProcess(freshSandboxed, config.agent.cwd, config.agent.timeout, {
+        onStdout(str) {
+          if (!capturedSessionId) {
+            capturedSessionId = cliBuilder.parseSessionId(str)
+          }
+          const text = cliBuilder.extractText(str)
+          if (!text) return
+          accumulated += text
+          const now = Date.now()
+          if (now - lastDraftTime >= throttle) {
+            lastDraftTime = now
+            sendDraft(targetChat, draftId, accumulated).catch(() => {})
+          }
+        },
+      })
+      freshSandboxed.cleanup?.()
+    }
+
+    // Update session — track whether we have an active session for --continue
     const updatedSession = {
-      id: capturedSessionId ?? currentSession.id,
+      id: capturedSessionId ?? null,
       turns: currentSession.turns + 1,
     }
     sessions = { ...sessions, [type]: updatedSession }
@@ -453,22 +561,11 @@ function startHeartbeat(): void {
     if (!isActiveHours()) return
     if (isProcessing) return
 
-    // Cheap checks first
-    let hasChanges = false
-    for (const cmd of config.heartbeat.checks) {
-      try {
-        const output = await execShell(cmd, config.agent.cwd)
-        if (output.trim()) {
-          hasChanges = true
-          break
-        }
-      } catch {
-        hasChanges = true
-        break
-      }
-    }
+    // Recover stuck todos before checking
+    recoverStuck(DATA_DIR, config.agent.timeout)
 
-    if (!hasChanges) return
+    // Cheap check: skip if no pending todos
+    if (getNextTodo(DATA_DIR) === null) return
 
     await spawnCli('heartbeat')
   }, intervalMs)
@@ -477,7 +574,7 @@ function startHeartbeat(): void {
 // === Main ===
 
 async function main(): Promise<void> {
-  console.log(`[beatclaw] Starting daemon (cli: ${config.agent.cli}, cwd: ${config.agent.cwd})`)
+  console.log(`[heartbeat] Starting daemon (cli: ${config.agent.cli}, cwd: ${config.agent.cwd})`)
 
   // Ensure data directory (mkdirSync recursive is idempotent)
   mkdirSync(DATA_DIR, { recursive: true })
@@ -492,7 +589,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      console.log(`[beatclaw] Received ${signal}, shutting down...`)
+      console.log(`[heartbeat] Received ${signal}, shutting down...`)
       bot.stop()
       process.exit(0)
     })
@@ -500,6 +597,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[beatclaw] Fatal error:', err)
+  console.error('[heartbeat] Fatal error:', err)
   process.exit(1)
 })

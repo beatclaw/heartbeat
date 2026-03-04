@@ -17,9 +17,10 @@ heartbeat:
     - "gh run list --limit 1 --json status --jq '.[0].status' | grep -v completed"
   prompt: |
     1. Use telegram_read to check for new messages. Handle them.
-    2. Use heartbeat_check to see if anything needs attention.
-    3. If issues found, fix them and report via telegram_send.
-    4. If nothing to do, just output HEARTBEAT_OK.
+    2. Use todo_list to check for pending tasks. Pick the highest priority one and work on it.
+    3. Use heartbeat_check to see if anything needs attention.
+    4. If issues found, fix them and report via telegram_send.
+    5. If nothing to do, just output HEARTBEAT_OK.
 
 mcp:
   port: 39100
