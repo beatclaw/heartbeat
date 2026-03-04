@@ -11,7 +11,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
-import { getCliBuilder, type CliBuilder } from './cli.js'
+import { getCliBuilder, type CliBuilder, createActivityExtractor } from './cli.js'
 import { wrapWithSandbox, type SandboxConfig } from './sandbox.js'
 import { loadTodos, addTodo, updateTodo, getNextTodo, clearDone, recoverStuck } from './todos.js'
 
@@ -21,6 +21,7 @@ interface TelegramMessage {
   from: string
   text: string
   chat_id: number
+  message_id: number
 }
 
 interface Config {
@@ -131,6 +132,23 @@ function isAllowed(userId: number): boolean {
   return config.telegram.allowed_users.includes(userId)
 }
 
+bot.command('help', async (ctx) => {
+  await ctx.reply(
+    [
+      '📖 BeatClaw Heartbeat 명령어',
+      '',
+      '/help — 이 도움말 표시',
+      '/ping — 봇 응답 확인',
+      '/todo <내용> — 새 todo 추가 (medium 우선순위)',
+      '/todos — 대기/진행 중인 todo 목록 조회',
+      '/clear — 완료/실패한 todo 삭제',
+      '/chatid — 현재 Chat ID / User ID 확인',
+      '',
+      '일반 메시지를 보내면 AI가 자동으로 처리합니다.',
+    ].join('\n'),
+  )
+})
+
 bot.command('chatid', async (ctx) => {
   await ctx.reply(`Chat ID: ${ctx.chat.id}\nUser ID: ${ctx.from?.id}`)
 })
@@ -178,6 +196,7 @@ bot.on('message:text', async (ctx) => {
     from: ctx.from.first_name ?? 'User',
     text: ctx.message.text,
     chat_id: ctx.chat.id,
+    message_id: ctx.message.message_id,
   }]
 
   if (!isProcessing) {
@@ -221,6 +240,27 @@ async function sendFinalMessage(chatId: number, text: string): Promise<void> {
   for (const chunk of chunks) {
     await bot.api.sendMessage(chatId, chunk)
   }
+}
+
+// === Telegram Feedback Helpers ===
+
+function setReaction(chatId: number, messageId: number, emoji: string): void {
+  bot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji } as any])
+    .catch(() => {})
+}
+
+async function createStatusMessage(chatId: number): Promise<number | null> {
+  try {
+    const msg = await bot.api.sendMessage(chatId, '⏳ Processing...')
+    return msg.message_id
+  } catch { return null }
+}
+
+function editStatusMessage(chatId: number, msgId: number, text: string): void {
+  const truncated = text.length > TELEGRAM_MAX_LENGTH
+    ? text.slice(0, TELEGRAM_MAX_LENGTH - 4) + ' ...'
+    : text
+  bot.api.editMessageText(chatId, msgId, truncated).catch(() => {})
 }
 
 // === MCP SSE Server ===
@@ -414,6 +454,10 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
     ? { id: null, turns: 0 }
     : session
 
+  const triggerMessageId: number | null = type === 'user' && messageBuffer.length > 0
+    ? messageBuffer[messageBuffer.length - 1]!.message_id
+    : null
+
   // Build prompt with cross-context
   let prompt: string
   if (type === 'user') {
@@ -449,21 +493,52 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   let lastDraftTime = 0
   const throttle = config.streaming.throttle
 
+  let extractActivity = createActivityExtractor(config.agent.cli)
+  let statusLines: readonly string[] = []
+  let lastStatusTime = 0
+  const STATUS_THROTTLE = 1000
+
+  const statusMessageId: number | null = type === 'user'
+    ? await createStatusMessage(targetChat)
+    : null
+
+  if (triggerMessageId !== null) {
+    setReaction(targetChat, triggerMessageId, '🤔')
+  }
+
+  const handleStdout = (str: string): void => {
+    if (!capturedSessionId) {
+      capturedSessionId = cliBuilder.parseSessionId(str)
+    }
+    const text = cliBuilder.extractText(str)
+    if (text) {
+      accumulated += text
+      const now = Date.now()
+      if (now - lastDraftTime >= throttle) {
+        lastDraftTime = now
+        sendDraft(targetChat, draftId, accumulated).catch(() => {})
+      }
+    }
+
+    const activity = extractActivity(str)
+    if (activity) {
+      if (activity.emoji && triggerMessageId !== null) {
+        setReaction(targetChat, triggerMessageId, activity.emoji)
+      }
+      if (activity.label && statusMessageId !== null) {
+        statusLines = [...statusLines, activity.label]
+        const now = Date.now()
+        if (now - lastStatusTime >= STATUS_THROTTLE) {
+          lastStatusTime = now
+          editStatusMessage(targetChat, statusMessageId, statusLines.join('\n'))
+        }
+      }
+    }
+  }
+
   try {
     const exitCode = await runCliProcess(sandboxed, config.agent.cwd, config.agent.timeout, {
-      onStdout(str) {
-        if (!capturedSessionId) {
-          capturedSessionId = cliBuilder.parseSessionId(str)
-        }
-        const text = cliBuilder.extractText(str)
-        if (!text) return
-        accumulated += text
-        const now = Date.now()
-        if (now - lastDraftTime >= throttle) {
-          lastDraftTime = now
-          sendDraft(targetChat, draftId, accumulated).catch(() => {})
-        }
-      },
+      onStdout: handleStdout,
     })
 
     // Continue failed → retry once as fresh session
@@ -471,24 +546,15 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       console.error(`[cli] Continue failed (exit ${exitCode}), retrying as fresh session`)
       accumulated = ''
       capturedSessionId = null
+      extractActivity = createActivityExtractor(config.agent.cli)
+      statusLines = []
+      lastStatusTime = 0
       const freshArgs = cliBuilder.buildArgs(null, prompt)
       const freshSandboxed = wrapWithSandbox(
         cliBuilder.command, freshArgs, config.sandbox, config.agent.cwd, config.agent.cli
       )
       await runCliProcess(freshSandboxed, config.agent.cwd, config.agent.timeout, {
-        onStdout(str) {
-          if (!capturedSessionId) {
-            capturedSessionId = cliBuilder.parseSessionId(str)
-          }
-          const text = cliBuilder.extractText(str)
-          if (!text) return
-          accumulated += text
-          const now = Date.now()
-          if (now - lastDraftTime >= throttle) {
-            lastDraftTime = now
-            sendDraft(targetChat, draftId, accumulated).catch(() => {})
-          }
-        },
+        onStdout: handleStdout,
       })
       freshSandboxed.cleanup?.()
     }
@@ -507,6 +573,15 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       // Suppress — nothing to report
     } else if (finalText) {
       await sendFinalMessage(targetChat, finalText)
+    }
+
+    // Completion feedback
+    if (triggerMessageId !== null) {
+      setReaction(targetChat, triggerMessageId, '👍')
+    }
+    if (statusMessageId !== null) {
+      const finalStatus = [...statusLines, '✅ Done'].join('\n')
+      editStatusMessage(targetChat, statusMessageId, finalStatus)
     }
 
     // Save cross-context immutably
@@ -564,7 +639,7 @@ function startHeartbeat(): void {
     // Recover stuck todos before checking
     recoverStuck(DATA_DIR, config.agent.timeout)
 
-    // Cheap check: skip if no pending todos
+    // Todo check: skip if no pending todos
     if (getNextTodo(DATA_DIR) === null) return
 
     await spawnCli('heartbeat')
