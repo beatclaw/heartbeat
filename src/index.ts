@@ -25,9 +25,9 @@ interface TelegramMessage {
 }
 
 interface Config {
-  agent: { cli: string; cwd: string; timeout: number; session_max_turns: number }
+  agent: { cli: string; cwd: string; timeout: number; session_max_turns: number; kill_grace: number; cross_context_max_chars: number }
   telegram: { token: string; default_chat_id: number; allowed_users: number[] }
-  heartbeat: { interval: string; idle_interval?: string; checks: string[]; prompt: string }
+  heartbeat: { interval: string; checks: string[]; check_timeout: number; prompt: string }
   mcp: { port: number; token: string }
   sandbox: SandboxConfig
   streaming: { throttle: number; fallback: boolean }
@@ -55,7 +55,6 @@ function resolveEnvValue(val: string): string {
 
 const CONFIG_PATH = join(process.cwd(), 'config.yaml')
 const DATA_DIR = join(process.cwd(), 'data')
-const CROSS_CONTEXT_MAX_CHARS = 500
 
 function loadConfig(): Config {
   if (!existsSync(CONFIG_PATH)) {
@@ -376,7 +375,7 @@ function createMcpServer(): McpServer {
 
 function execShell(cmd: string, cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    exec(cmd, { cwd, timeout: 30_000 }, (err, stdout, stderr) => {
+    exec(cmd, { cwd, timeout: config.heartbeat.check_timeout }, (err, stdout, stderr) => {
       if (err) return reject(err)
       resolve(stdout + stderr)
     })
@@ -455,8 +454,17 @@ function runCliProcess(
     activeChild = child
     child.on('exit', () => { activeChild = null })
 
+    // Line buffer: accumulate partial lines across chunks so JSON parsing
+    // always sees complete newline-terminated lines (prevents session_id loss)
+    let lineBuffer = ''
+
     child.stdout?.on('data', (chunk: Buffer) => {
-      callbacks.onStdout(chunk.toString())
+      const data = lineBuffer + chunk.toString()
+      const lines = data.split('\n')
+      lineBuffer = lines.pop() ?? ''
+      if (lines.length > 0) {
+        callbacks.onStdout(lines.join('\n') + '\n')
+      }
     })
 
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -468,16 +476,22 @@ function runCliProcess(
       resolve(1)
     })
 
-    child.on('exit', (code) => resolve(code ?? 0))
+    // Use 'close' (not 'exit') to ensure all stdio is consumed before resolving
+    child.on('close', (code) => {
+      if (lineBuffer) {
+        callbacks.onStdout(lineBuffer)
+        lineBuffer = ''
+      }
+      clearTimeout(timer)
+      resolve(code ?? 0)
+    })
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM')
       setTimeout(() => {
         if (!child.killed) child.kill('SIGKILL')
-      }, 5000)
+      }, config.agent.kill_grace)
     }, timeout)
-
-    child.on('exit', () => clearTimeout(timer))
   })
 }
 
@@ -506,13 +520,13 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
     messageBuffer = []
     prompt = `New messages:\n${messages}`
     if (context.lastHeartbeat) {
-      const truncated = context.lastHeartbeat.slice(0, CROSS_CONTEXT_MAX_CHARS)
+      const truncated = context.lastHeartbeat.slice(0, config.agent.cross_context_max_chars)
       prompt += `\n\n---\n[Heartbeat context (read-only):\n${truncated}]`
     }
   } else {
     prompt = config.heartbeat.prompt
     if (context.lastUser) {
-      const truncated = context.lastUser.slice(0, CROSS_CONTEXT_MAX_CHARS)
+      const truncated = context.lastUser.slice(0, config.agent.cross_context_max_chars)
       prompt += `\n\n---\n[User context (read-only):\n${truncated}]`
     }
   }
@@ -567,9 +581,11 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       onStdout: handleStdout,
     })
 
-    // Continue failed → retry once as fresh session
+    // Resume failed → retry once as fresh session
+    let didRetryFresh = false
     if (exitCode !== 0 && currentSession.id) {
-      console.error(`[cli] Continue failed (exit ${exitCode}), retrying as fresh session`)
+      didRetryFresh = true
+      console.error(`[cli] Resume failed (exit ${exitCode}), retrying as fresh session`)
       accumulated = ''
       capturedSessionId = null
       extractActivity = createActivityExtractor(config.agent.cli)
@@ -583,13 +599,17 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       freshSandboxed.cleanup?.()
     }
 
-    // Update session — track whether we have an active session for --continue
+    // Update session — preserve existing ID if capture failed during successful resume
+    const effectiveSessionId = capturedSessionId
+      ?? (didRetryFresh ? null : currentSession.id)
+    const sessionChanged = effectiveSessionId !== currentSession.id
     const updatedSession = {
-      id: capturedSessionId ?? null,
-      turns: currentSession.turns + 1,
+      id: effectiveSessionId,
+      turns: sessionChanged ? 1 : currentSession.turns + 1,
     }
     sessions = { ...sessions, [type]: updatedSession }
     saveJson('sessions.json', sessions)
+    console.log(`[cli] ${type} session: ${currentSession.id?.slice(0, 8) ?? 'new'} → ${effectiveSessionId?.slice(0, 8) ?? 'null'} (turn ${updatedSession.turns}${sessionChanged ? ', reset' : ''})`)
 
     // HEARTBEAT_OK suppression
     const finalText = accumulated.trim()
@@ -605,7 +625,7 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
     }
 
     // Save cross-context immutably
-    const summary = finalText.slice(0, CROSS_CONTEXT_MAX_CHARS)
+    const summary = finalText.slice(0, config.agent.cross_context_max_chars)
     context = type === 'user'
       ? { ...context, lastUser: summary }
       : { ...context, lastHeartbeat: summary }
@@ -630,7 +650,7 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
 
 function parseInterval(interval: string): number {
   const match = interval.match(/^(\d+)(s|m|h)$/)
-  if (!match) return 30 * 60 * 1000 // default 30m
+  if (!match) throw new Error(`Invalid interval format: "${interval}" (expected <number>s|m|h)`)
   const [, num, unit] = match
   const multiplier = { s: 1000, m: 60_000, h: 3_600_000 }[unit!]!
   return parseInt(num!, 10) * multiplier
@@ -639,24 +659,15 @@ function parseInterval(interval: string): number {
 
 function startHeartbeat(): void {
   const intervalMs = parseInterval(config.heartbeat.interval)
-  const idleIntervalMs = parseInterval(config.heartbeat.idle_interval ?? '30m')
-  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${intervalMs}ms), idle: ${config.heartbeat.idle_interval ?? '30m'} (${idleIntervalMs}ms)`)
+  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${intervalMs}ms)`)
 
   const tick = async () => {
-    let nextDelay = intervalMs
-
     if (!isProcessing) {
       recoverStuck(DATA_DIR, config.agent.timeout)
-
-      if (getNextTodo(DATA_DIR) === null) {
-        nextDelay = idleIntervalMs
-        await spawnCli('heartbeat')
-      } else {
-        await spawnCli('heartbeat')
-      }
+      await spawnCli('heartbeat')
     }
 
-    setTimeout(tick, nextDelay)
+    setTimeout(tick, intervalMs)
   }
 
   setTimeout(tick, intervalMs)
@@ -718,7 +729,7 @@ async function main(): Promise<void> {
     `<pre>@beatclaw/heartbeat v0.1.0`,
     `cli  ${config.agent.cli}`,
     `cwd  ${shortCwd}`,
-    `beat ${config.heartbeat.interval} (idle: ${config.heartbeat.idle_interval ?? '30m'})`,
+    `beat ${config.heartbeat.interval}`,
     `mcp  :${config.mcp.port}</pre>`,
   ].join('\n')
   bot.api.sendMessage(targetChat, startMsg, { parse_mode: 'HTML' }).catch(() => {})

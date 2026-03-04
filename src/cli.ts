@@ -16,7 +16,7 @@ export class ClaudeCodeBuilder implements CliBuilder {
 
   buildArgs(sessionId: string | null, prompt: string): string[] {
     const args = sessionId
-      ? ['--continue', sessionId, '-p', prompt]
+      ? ['--resume', sessionId, '-p', prompt]
       : ['-p', prompt]
     return [...args, '--dangerously-skip-permissions', '--output-format', 'stream-json', '--verbose']
   }

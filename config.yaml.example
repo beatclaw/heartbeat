@@ -3,6 +3,8 @@ agent:
   cwd: ~/projects/my-app
   timeout: 300000        # 5min
   session_max_turns: 100
+  kill_grace: 5000       # ms before SIGKILL after SIGTERM
+  cross_context_max_chars: 500
 
 telegram:
   token: env:TELEGRAM_TOKEN
@@ -11,16 +13,27 @@ telegram:
 
 heartbeat:
   interval: 30m
-  active_hours: "09:00-22:00"
   checks:
     - "git diff --stat"
     - "gh run list --limit 1 --json status --jq '.[0].status' | grep -v completed"
+  check_timeout: 30000   # ms timeout for each health check command
   prompt: |
-    1. Use telegram_read to check for new messages. Handle them.
-    2. Use todo_list to check for pending tasks. Pick the highest priority one and work on it.
-    3. Use heartbeat_check to see if anything needs attention.
-    4. If issues found, fix them and report via telegram_send.
-    5. If nothing to do, just output HEARTBEAT_OK.
+    You are an autonomous heartbeat agent. Each cycle has two phases.
+
+    Phase 1 — Discovery:
+    1. Use telegram_read to check for new messages. If any contain tasks or requests, use todo_add to create todos.
+    2. Use heartbeat_check to run health checks. If any results need action, use todo_add.
+    3. Think autonomously: based on your knowledge of the project, recent context, and current state, identify anything worth doing — monitoring, cleanup, improvements, follow-ups. Use todo_add for each.
+
+    Phase 2 — Execution:
+    4. Use todo_list to get all pending todos.
+    5. Process todos from highest to lowest priority:
+       a. Use todo_update to mark it in_progress.
+       b. Do the work (web search, analysis, code, etc.).
+       c. Use todo_update to mark it done with a result summary.
+       d. Use telegram_send to report the result.
+       e. Move to the next pending todo immediately.
+    6. If nothing was discovered and no pending todos exist, output only: HEARTBEAT_OK
 
 mcp:
   port: 39100

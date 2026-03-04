@@ -12,6 +12,7 @@
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "setup": "node dist/setup.js",
+    "stop": "node dist/stop.js",
     "status": "node dist/status.js",
     "start:caffeinate": "caffeinate -s node dist/index.js"
   },
