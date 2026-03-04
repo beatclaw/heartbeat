@@ -1,17 +1,19 @@
 {
-  "name": "beatclaw",
+  "name": "@beatclaw/heartbeat",
   "version": "0.1.0",
   "description": "Give your CLI a heartbeat",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "beatclaw": "dist/setup.js"
+    "heartbeat": "dist/setup.js"
   },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
-    "setup": "node dist/setup.js"
+    "setup": "node dist/setup.js",
+    "status": "node dist/status.js",
+    "start:caffeinate": "caffeinate -s node dist/index.js"
   },
   "keywords": ["claude-code", "codex", "telegram", "mcp", "heartbeat", "agent"],
   "author": "",

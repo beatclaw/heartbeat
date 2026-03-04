@@ -2,7 +2,7 @@
 // src/setup.ts — Interactive setup: config + MCP registration + service
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, chmodSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { homedir, platform } from 'node:os'
 import { execSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -37,7 +37,7 @@ function shellExec(cmd: string): string {
 // === Main Setup ===
 
 async function setup(): Promise<void> {
-  console.log('\n  BeatClaw Setup — Give your CLI a heartbeat\n')
+  console.log('\n  Heartbeat Setup — Give your CLI a heartbeat\n')
 
   // Check if config already exists
   const configPath = join(process.cwd(), 'config.yaml')
@@ -161,7 +161,7 @@ async function setup(): Promise<void> {
     },
     heartbeat: {
       interval,
-      active_hours: '09:00-22:00',
+      idle_interval: '30m',
       checks: [
         'git diff --stat',
         "gh run list --limit 1 --json status --jq '.[0].status' | grep -v completed",
@@ -194,10 +194,7 @@ async function setup(): Promise<void> {
   log(`Written: config.yaml (chmod 600)`)
 
   // 10. Ensure data directory
-  const dataDir = join(process.cwd(), 'data')
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true })
-  }
+  mkdirSync(join(process.cwd(), 'data'), { recursive: true })
 
   // 11. Copy system prompt template to project
   const templateFile = cli === 'claude' ? 'CLAUDE.md' : 'AGENTS.md'
@@ -240,7 +237,7 @@ async function setup(): Promise<void> {
   if (telegramToken && chatId) {
     const testBot = new Bot(telegramToken)
     try {
-      await testBot.api.sendMessage(chatId, "Hello! I'm alive. BeatClaw is ready.")
+      await testBot.api.sendMessage(chatId, "Hello! I'm alive. Heartbeat is ready.")
       log('Test message sent successfully!')
     } catch (err) {
       log(`Failed to send test message: ${(err as Error).message}`)
@@ -256,22 +253,15 @@ async function setup(): Promise<void> {
 async function registerMcp(cli: string, port: number, token: string): Promise<void> {
   const url = `http://localhost:${port}/sse`
 
-  if (cli === 'claude') {
-    const cmd = `claude mcp add --transport http beatclaw ${url} --header "Authorization: Bearer ${token}"`
-    const result = shellExec(cmd)
-    if (result !== undefined) {
-      log(`Registered MCP in Claude Code: ${cmd}`)
-    } else {
-      log(`Failed to register MCP. Run manually:\n  ${cmd}`)
-    }
-  } else {
-    const cmd = `codex mcp add beatclaw --url ${url}`
-    const result = shellExec(cmd)
-    if (result !== undefined) {
-      log(`Registered MCP in Codex CLI: ${cmd}`)
-    } else {
-      log(`Failed to register MCP. Run manually:\n  ${cmd}`)
-    }
+  const cmd = cli === 'claude'
+    ? `claude mcp add --transport http heartbeat ${url} --header "Authorization: Bearer ${token}"`
+    : `codex mcp add heartbeat --url ${url}`
+
+  try {
+    execSync(cmd, { encoding: 'utf-8', timeout: 10_000 })
+    log(`Registered MCP: ${cmd}`)
+  } catch {
+    log(`Failed to register MCP. Run manually:\n  ${cmd}`)
   }
 }
 
@@ -292,7 +282,7 @@ async function installService(): Promise<void> {
 }
 
 async function installLaunchd(cwd: string, nodePath: string): Promise<void> {
-  const plistName = 'com.beatclaw.plist'
+  const plistName = 'com.beatclaw.heartbeat.plist'
   const plistPath = join(HOME, 'Library', 'LaunchAgents', plistName)
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -300,7 +290,7 @@ async function installLaunchd(cwd: string, nodePath: string): Promise<void> {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.beatclaw</string>
+  <string>com.beatclaw.heartbeat</string>
   <key>ProgramArguments</key>
   <array>
     <string>${nodePath}</string>
@@ -313,9 +303,9 @@ async function installLaunchd(cwd: string, nodePath: string): Promise<void> {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${join(cwd, 'data', 'beatclaw.log')}</string>
+  <string>${join(cwd, 'data', 'heartbeat.log')}</string>
   <key>StandardErrorPath</key>
-  <string>${join(cwd, 'data', 'beatclaw.error.log')}</string>
+  <string>${join(cwd, 'data', 'heartbeat.error.log')}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -324,23 +314,20 @@ async function installLaunchd(cwd: string, nodePath: string): Promise<void> {
 </dict>
 </plist>`
 
-  const laDir = join(HOME, 'Library', 'LaunchAgents')
-  if (!existsSync(laDir)) {
-    mkdirSync(laDir, { recursive: true })
-  }
+  mkdirSync(join(HOME, 'Library', 'LaunchAgents'), { recursive: true })
   writeFileSync(plistPath, plist, 'utf-8')
   shellExec(`launchctl load ${plistPath}`)
   log(`Installed launchd service: ${plistPath}`)
-  log('  Start: launchctl load ~/Library/LaunchAgents/com.beatclaw.plist')
-  log('  Stop:  launchctl unload ~/Library/LaunchAgents/com.beatclaw.plist')
+  log('  Start: launchctl load ~/Library/LaunchAgents/com.beatclaw.heartbeat.plist')
+  log('  Stop:  launchctl unload ~/Library/LaunchAgents/com.beatclaw.heartbeat.plist')
 }
 
 async function installSystemd(cwd: string, nodePath: string): Promise<void> {
   const serviceDir = join(HOME, '.config', 'systemd', 'user')
-  const servicePath = join(serviceDir, 'beatclaw.service')
+  const servicePath = join(serviceDir, 'heartbeat.service')
 
   const service = `[Unit]
-Description=BeatClaw Daemon
+Description=Heartbeat Daemon
 After=network.target
 
 [Service]
@@ -353,18 +340,16 @@ RestartSec=10
 [Install]
 WantedBy=default.target`
 
-  if (!existsSync(serviceDir)) {
-    mkdirSync(serviceDir, { recursive: true })
-  }
+  mkdirSync(serviceDir, { recursive: true })
   writeFileSync(servicePath, service, 'utf-8')
   shellExec('systemctl --user daemon-reload')
-  shellExec('systemctl --user enable beatclaw')
-  shellExec('systemctl --user start beatclaw')
+  shellExec('systemctl --user enable heartbeat')
+  shellExec('systemctl --user start heartbeat')
   log(`Installed systemd service: ${servicePath}`)
-  log('  Start:   systemctl --user start beatclaw')
-  log('  Stop:    systemctl --user stop beatclaw')
-  log('  Restart: systemctl --user restart beatclaw')
-  log('  Logs:    journalctl --user -u beatclaw -f')
+  log('  Start:   systemctl --user start heartbeat')
+  log('  Stop:    systemctl --user stop heartbeat')
+  log('  Restart: systemctl --user restart heartbeat')
+  log('  Logs:    journalctl --user -u heartbeat -f')
 }
 
 // === Entry ===

@@ -1,4 +1,4 @@
-# BeatClaw
+# Heartbeat
 
 *Give your CLI a heartbeat*
 
@@ -22,12 +22,12 @@ Telegram message → Daemon → CLI spawn (Claude Code / Codex CLI) → stdout s
 
 ```bash
 # 1. Clone and build
-git clone https://github.com/beatclaw/beatclaw.git
-cd beatclaw
+git clone https://github.com/beatclaw/heartbeat.git
+cd heartbeat
 npm install && npm run build
 
 # 2. Run interactive setup
-npx beatclaw
+npx @beatclaw/heartbeat
 # - Select CLI (Claude Code / Codex CLI)
 # - Enter Telegram bot token
 # - Detect chat ID
@@ -42,8 +42,8 @@ npx beatclaw
 
 | CLI | Status | MCP Registration |
 |-----|--------|------------------|
-| Claude Code | v0.1 | `claude mcp add --transport http beatclaw ...` |
-| Codex CLI | v0.1 | `codex mcp add beatclaw --url ...` |
+| Claude Code | v0.1 | `claude mcp add --transport http heartbeat ...` |
+| Codex CLI | v0.1 | `codex mcp add heartbeat --url ...` |
 
 ## MCP Tools
 
@@ -88,7 +88,7 @@ The daemon runs three subsystems:
 2. **MCP SSE Server** (localhost) — provides tools to the CLI during execution
 3. **Heartbeat Timer** — runs cheap shell checks, spawns CLI only when changes detected
 
-The CLI (Claude Code or Codex CLI) is the primary agent. BeatClaw only provides:
+The CLI (Claude Code or Codex CLI) is the primary agent. Heartbeat only provides:
 - Event detection (Telegram messages, heartbeat checks)
 - Streaming relay (stdout → Telegram drafts)
 - MCP tools (read/send messages, run checks)
@@ -120,13 +120,13 @@ Uses Telegram Bot API 9.5 `sendMessageDraft` for real-time streaming:
 
 ```bash
 # macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.beatclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.beatclaw.plist
+launchctl load ~/Library/LaunchAgents/com.beatclaw.heartbeat.plist
+launchctl unload ~/Library/LaunchAgents/com.beatclaw.heartbeat.plist
 
 # Linux (systemd)
-systemctl --user start beatclaw
-systemctl --user stop beatclaw
-journalctl --user -u beatclaw -f
+systemctl --user start heartbeat
+systemctl --user stop heartbeat
+journalctl --user -u heartbeat -f
 ```
 
 ## Roadmap

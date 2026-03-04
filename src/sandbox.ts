@@ -42,7 +42,7 @@ ${allows}
 (allow file-write* (subpath "/tmp"))
 (allow file-write* (regex #"^/dev/"))`
 
-  const profilePath = join(tmpdir(), `beatclaw-sandbox-${Date.now()}.sb`)
+  const profilePath = join(tmpdir(), `heartbeat-sandbox-${Date.now()}.sb`)
   writeFileSync(profilePath, profile, 'utf-8')
 
   return {

@@ -4,7 +4,7 @@
 import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { spawn, exec, type ChildProcess } from 'node:child_process'
+import { spawn, exec, execSync, type ChildProcess } from 'node:child_process'
 import { Bot } from 'grammy'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
@@ -27,7 +27,7 @@ interface TelegramMessage {
 interface Config {
   agent: { cli: string; cwd: string; timeout: number; session_max_turns: number }
   telegram: { token: string; default_chat_id: number; allowed_users: number[] }
-  heartbeat: { interval: string; active_hours: string; checks: string[]; prompt: string }
+  heartbeat: { interval: string; idle_interval?: string; checks: string[]; prompt: string }
   mcp: { port: number; token: string }
   sandbox: SandboxConfig
   streaming: { throttle: number; fallback: boolean }
@@ -113,6 +113,7 @@ const cliBuilder: CliBuilder = getCliBuilder(config.agent.cli)
 
 let messageBuffer: readonly TelegramMessage[] = []
 let isProcessing = false
+let activeChild: ChildProcess | null = null
 
 let sessions: Sessions = loadJson('sessions.json', {
   user: { id: null, turns: 0 },
@@ -133,39 +134,47 @@ function isAllowed(userId: number): boolean {
 }
 
 bot.command('help', async (ctx) => {
-  await ctx.reply(
-    [
-      '📖 BeatClaw Heartbeat 명령어',
-      '',
-      '/help — 이 도움말 표시',
-      '/ping — 봇 응답 확인',
-      '/todo <내용> — 새 todo 추가 (medium 우선순위)',
-      '/todos — 대기/진행 중인 todo 목록 조회',
-      '/clear — 완료/실패한 todo 삭제',
-      '/chatid — 현재 Chat ID / User ID 확인',
-      '',
-      '일반 메시지를 보내면 AI가 자동으로 처리합니다.',
-    ].join('\n'),
-  )
+  const msg = [
+    '📖 <b>Help</b>',
+    '',
+    '/help — Show this help',
+    '/ping — Check bot status',
+    '/todo &lt;text&gt; — Add a new todo',
+    '/todos — List active todos',
+    '/clear — Remove completed todos',
+    '/chatid — Show Chat ID / User ID',
+    '/stop — Stop current AI task',
+    '/exit — Shut down the daemon (also: /shutdown, /quit)',
+    '',
+    'Send any message to trigger the AI agent.',
+  ].join('\n')
+  await ctx.reply(msg, { parse_mode: 'HTML' })
 })
 
 bot.command('chatid', async (ctx) => {
-  await ctx.reply(`Chat ID: ${ctx.chat.id}\nUser ID: ${ctx.from?.id}`)
+  const msg = [
+    '🆔 <b>Chat Info</b>',
+    '',
+    `Chat: <code>${ctx.chat.id}</code>`,
+    `User: <code>${ctx.from?.id}</code>`,
+  ].join('\n')
+  await ctx.reply(msg, { parse_mode: 'HTML' })
 })
 
 bot.command('ping', async (ctx) => {
-  await ctx.reply('pong')
+  await ctx.reply('🏓 <b>Pong</b>', { parse_mode: 'HTML' })
 })
 
 bot.command('todo', async (ctx) => {
   if (!ctx.from || !isAllowed(ctx.from.id)) return
   const text = ctx.match?.trim()
   if (!text) {
-    await ctx.reply('Usage: /todo <task description>')
+    await ctx.reply('📝 Usage: /todo &lt;task description&gt;', { parse_mode: 'HTML' })
     return
   }
   const todo = addTodo(DATA_DIR, { title: text, source: 'user', priority: 'medium' })
-  await ctx.reply(`Added: ${todo.title} (${todo.id.slice(0, 8)})`)
+  const msg = `📝 <b>Added</b>\n${todo.title} <code>${todo.id.slice(0, 8)}</code>`
+  await ctx.reply(msg, { parse_mode: 'HTML' })
 })
 
 bot.command('todos', async (ctx) => {
@@ -173,20 +182,63 @@ bot.command('todos', async (ctx) => {
   const todos = loadTodos(DATA_DIR)
   const active = todos.filter(t => t.status === 'pending' || t.status === 'in_progress')
   if (active.length === 0) {
-    await ctx.reply('No pending tasks.')
+    await ctx.reply('📋 <b>Todos</b>\n\nNo active tasks.', { parse_mode: 'HTML' })
     return
   }
   const lines = active.map(t => {
     const icon = t.status === 'in_progress' ? '🔄' : '⏳'
-    return `${icon} ${t.title} (${t.priority})`
+    return `${icon} ${t.title} <i>(${t.priority})</i>`
   })
-  await ctx.reply(lines.join('\n'))
+  await ctx.reply(`📋 <b>Todos</b>\n\n${lines.join('\n')}`, { parse_mode: 'HTML' })
 })
 
 bot.command('clear', async (ctx) => {
   if (!ctx.from || !isAllowed(ctx.from.id)) return
   const removed = clearDone(DATA_DIR)
-  await ctx.reply(`Cleared ${removed} completed/failed tasks.`)
+  await ctx.reply(`🧹 <b>Clear</b>\n\nRemoved ${removed} completed/failed tasks.`, { parse_mode: 'HTML' })
+})
+
+bot.command('stop', async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  if (!activeChild) {
+    await ctx.reply('🛑 <b>Stop</b>\n\nNo active task.', { parse_mode: 'HTML' })
+    return
+  }
+  activeChild.kill('SIGTERM')
+  await ctx.reply('🛑 <b>Stop</b>\n\nTask terminated.', { parse_mode: 'HTML' })
+})
+
+bot.command(['exit', 'shutdown', 'quit'], async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  const msg = [
+    '⚠️ <b>Exit</b>',
+    '',
+    'This will shut down the daemon.',
+    'You will not be able to restart it from Telegram.',
+    '',
+    'Are you sure?',
+  ].join('\n')
+  await ctx.reply(msg, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [[
+        { text: 'Yes, shut down', callback_data: 'exit_confirm' },
+        { text: 'Cancel', callback_data: 'exit_cancel' },
+      ]],
+    },
+  })
+})
+
+bot.callbackQuery('exit_confirm', async (ctx) => {
+  await ctx.answerCallbackQuery()
+  await ctx.editMessageText('🔴 <b>Heartbeat Stopped</b>', { parse_mode: 'HTML' })
+  bot.stop()
+  process.exit(0)
+})
+
+bot.callbackQuery('exit_cancel', async (ctx) => {
+  await ctx.answerCallbackQuery()
+  await ctx.editMessageText('⚠️ <b>Exit</b>\n\nCancelled.', { parse_mode: 'HTML' })
 })
 
 bot.on('message:text', async (ctx) => {
@@ -249,19 +301,6 @@ function setReaction(chatId: number, messageId: number, emoji: string): void {
     .catch(() => {})
 }
 
-async function createStatusMessage(chatId: number): Promise<number | null> {
-  try {
-    const msg = await bot.api.sendMessage(chatId, '⏳ Processing...')
-    return msg.message_id
-  } catch { return null }
-}
-
-function editStatusMessage(chatId: number, msgId: number, text: string): void {
-  const truncated = text.length > TELEGRAM_MAX_LENGTH
-    ? text.slice(0, TELEGRAM_MAX_LENGTH - 4) + ' ...'
-    : text
-  bot.api.editMessageText(chatId, msgId, truncated).catch(() => {})
-}
 
 // === MCP SSE Server ===
 
@@ -413,6 +452,8 @@ function runCliProcess(
       sandboxed.args,
       { cwd, env: cleanEnv, stdio: ['ignore', 'pipe', 'pipe'] }
     )
+    activeChild = child
+    child.on('exit', () => { activeChild = null })
 
     child.stdout?.on('data', (chunk: Buffer) => {
       callbacks.onStdout(chunk.toString())
@@ -494,13 +535,6 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   const throttle = config.streaming.throttle
 
   let extractActivity = createActivityExtractor(config.agent.cli)
-  let statusLines: readonly string[] = []
-  let lastStatusTime = 0
-  const STATUS_THROTTLE = 1000
-
-  const statusMessageId: number | null = type === 'user'
-    ? await createStatusMessage(targetChat)
-    : null
 
   if (triggerMessageId !== null) {
     setReaction(targetChat, triggerMessageId, '🤔')
@@ -525,14 +559,6 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       if (activity.emoji && triggerMessageId !== null) {
         setReaction(targetChat, triggerMessageId, activity.emoji)
       }
-      if (activity.label && statusMessageId !== null) {
-        statusLines = [...statusLines, activity.label]
-        const now = Date.now()
-        if (now - lastStatusTime >= STATUS_THROTTLE) {
-          lastStatusTime = now
-          editStatusMessage(targetChat, statusMessageId, statusLines.join('\n'))
-        }
-      }
     }
   }
 
@@ -547,8 +573,6 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       accumulated = ''
       capturedSessionId = null
       extractActivity = createActivityExtractor(config.agent.cli)
-      statusLines = []
-      lastStatusTime = 0
       const freshArgs = cliBuilder.buildArgs(null, prompt)
       const freshSandboxed = wrapWithSandbox(
         cliBuilder.command, freshArgs, config.sandbox, config.agent.cwd, config.agent.cli
@@ -569,19 +593,15 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
 
     // HEARTBEAT_OK suppression
     const finalText = accumulated.trim()
-    if (type === 'heartbeat' && finalText === 'HEARTBEAT_OK') {
+    if (type === 'heartbeat' && finalText.includes('HEARTBEAT_OK')) {
       // Suppress — nothing to report
     } else if (finalText) {
       await sendFinalMessage(targetChat, finalText)
     }
 
-    // Completion feedback
+    // Completion reaction
     if (triggerMessageId !== null) {
       setReaction(targetChat, triggerMessageId, '👍')
-    }
-    if (statusMessageId !== null) {
-      const finalStatus = [...statusLines, '✅ Done'].join('\n')
-      editStatusMessage(targetChat, statusMessageId, finalStatus)
     }
 
     // Save cross-context immutably
@@ -616,39 +636,53 @@ function parseInterval(interval: string): number {
   return parseInt(num!, 10) * multiplier
 }
 
-function isActiveHours(): boolean {
-  const range = config.heartbeat.active_hours
-  if (!range) return true
-  const match = range.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/)
-  if (!match) return true
-  const now = new Date()
-  const currentMinutes = now.getHours() * 60 + now.getMinutes()
-  const startMinutes = parseInt(match[1]!, 10) * 60 + parseInt(match[2]!, 10)
-  const endMinutes = parseInt(match[3]!, 10) * 60 + parseInt(match[4]!, 10)
-  return currentMinutes >= startMinutes && currentMinutes <= endMinutes
-}
 
 function startHeartbeat(): void {
   const intervalMs = parseInterval(config.heartbeat.interval)
-  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${intervalMs}ms)`)
+  const idleIntervalMs = parseInterval(config.heartbeat.idle_interval ?? '30m')
+  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${intervalMs}ms), idle: ${config.heartbeat.idle_interval ?? '30m'} (${idleIntervalMs}ms)`)
 
-  setInterval(async () => {
-    if (!isActiveHours()) return
-    if (isProcessing) return
+  const tick = async () => {
+    let nextDelay = intervalMs
 
-    // Recover stuck todos before checking
-    recoverStuck(DATA_DIR, config.agent.timeout)
+    if (!isProcessing) {
+      recoverStuck(DATA_DIR, config.agent.timeout)
 
-    // Todo check: skip if no pending todos
-    if (getNextTodo(DATA_DIR) === null) return
+      if (getNextTodo(DATA_DIR) === null) {
+        nextDelay = idleIntervalMs
+        await spawnCli('heartbeat')
+      } else {
+        await spawnCli('heartbeat')
+      }
+    }
 
-    await spawnCli('heartbeat')
-  }, intervalMs)
+    setTimeout(tick, nextDelay)
+  }
+
+  setTimeout(tick, intervalMs)
 }
 
 // === Main ===
 
+function killExistingDaemon(): void {
+  try {
+    const pids = execSync(`lsof -ti :${config.mcp.port}`, { encoding: 'utf-8' }).trim()
+    if (!pids) return
+    for (const pid of pids.split('\n')) {
+      if (pid && pid !== String(process.pid)) {
+        process.kill(parseInt(pid, 10), 'SIGTERM')
+      }
+    }
+    // Brief wait for graceful shutdown
+    execSync('sleep 1')
+    console.log(`[heartbeat] Killed existing daemon on port ${config.mcp.port}`)
+  } catch {
+    // No process on port — nothing to kill
+  }
+}
+
 async function main(): Promise<void> {
+  killExistingDaemon()
   console.log(`[heartbeat] Starting daemon (cli: ${config.agent.cli}, cwd: ${config.agent.cwd})`)
 
   // Ensure data directory (mkdirSync recursive is idempotent)
@@ -657,14 +691,43 @@ async function main(): Promise<void> {
   // Config file permissions
   chmodSync(CONFIG_PATH, 0o600)
 
+  // Catch-all error handlers for diagnostics
+  process.on('uncaughtException', (err) => {
+    console.error('[heartbeat] Uncaught exception:', err)
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error('[heartbeat] Unhandled rejection:', reason)
+  })
+  process.on('exit', (code) => {
+    console.error(`[heartbeat] Process exiting with code ${code}`)
+  })
+
+  bot.catch((err) => {
+    console.error('[telegram] Bot error:', err)
+  })
+
   bot.start({ onStart: () => console.log('[telegram] Bot started (long-polling)') })
   startMcpServer()
   startHeartbeat()
 
+  const targetChat = config.telegram.default_chat_id
+  const shortCwd = config.agent.cwd.replace(homedir(), '~')
+  const startMsg = [
+    '🟢 <b>Heartbeat Started</b>',
+    '',
+    `<pre>@beatclaw/heartbeat v0.1.0`,
+    `cli  ${config.agent.cli}`,
+    `cwd  ${shortCwd}`,
+    `beat ${config.heartbeat.interval} (idle: ${config.heartbeat.idle_interval ?? '30m'})`,
+    `mcp  :${config.mcp.port}</pre>`,
+  ].join('\n')
+  bot.api.sendMessage(targetChat, startMsg, { parse_mode: 'HTML' }).catch(() => {})
+
   // Graceful shutdown
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, () => {
+    process.on(signal, async () => {
       console.log(`[heartbeat] Received ${signal}, shutting down...`)
+      await bot.api.sendMessage(targetChat, '🔴 <b>Heartbeat Stopped</b>', { parse_mode: 'HTML' }).catch(() => {})
       bot.stop()
       process.exit(0)
     })
