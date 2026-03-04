@@ -434,6 +434,7 @@ function startMcpServer(): void {
 
 interface CliCallbacks {
   onStdout(str: string): void
+  onStderr?(str: string): void
 }
 
 function runCliProcess(
@@ -468,7 +469,9 @@ function runCliProcess(
     })
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      console.error(`[cli] stderr: ${chunk.toString().slice(0, 500)}`)
+      const text = chunk.toString().slice(0, 500)
+      console.error(`[cli] stderr: ${text}`)
+      callbacks.onStderr?.(text)
     })
 
     child.on('error', (err) => {
@@ -505,9 +508,13 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   const session = sessions[type]
 
   // Reset session if max turns exceeded
-  const currentSession = session.turns >= config.agent.session_max_turns
-    ? { id: null, turns: 0 }
-    : session
+  let currentSession: { id: string | null; turns: number }
+  if (session.turns >= config.agent.session_max_turns) {
+    console.log(`[cli] ${type} session expired: turns (${session.turns}) >= max (${config.agent.session_max_turns})`)
+    currentSession = { id: null, turns: 0 }
+  } else {
+    currentSession = session
+  }
 
   const triggerMessageId: number | null = type === 'user' && messageBuffer.length > 0
     ? messageBuffer[messageBuffer.length - 1]!.message_id
@@ -547,6 +554,7 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   let capturedSessionId: string | null = null
   let lastDraftTime = 0
   const throttle = config.streaming.throttle
+  let lastStderr = ''
 
   let extractActivity = createActivityExtractor(config.agent.cli)
 
@@ -579,22 +587,32 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
   try {
     const exitCode = await runCliProcess(sandboxed, config.agent.cwd, config.agent.timeout, {
       onStdout: handleStdout,
+      onStderr: (text) => { lastStderr = text },
     })
 
-    // Resume failed → retry once as fresh session
+    // Resume failed → retry once as fresh session with previous context
     let didRetryFresh = false
     if (exitCode !== 0 && currentSession.id) {
       didRetryFresh = true
-      console.error(`[cli] Resume failed (exit ${exitCode}), retrying as fresh session`)
+      console.error(`[cli] Resume ${currentSession.id.slice(0, 8)} failed (exit ${exitCode}): ${lastStderr.slice(0, 200)}`)
       accumulated = ''
       capturedSessionId = null
+      lastStderr = ''
       extractActivity = createActivityExtractor(config.agent.cli)
-      const freshArgs = cliBuilder.buildArgs(null, prompt)
+
+      // Inject previous session summary so the fresh session has context
+      const prevSummary = type === 'user' ? context.lastUser : context.lastHeartbeat
+      const freshPrompt = prevSummary
+        ? `${prompt}\n\n---\n[Previous session summary (session was reset, preserve continuity):\n${prevSummary.slice(0, config.agent.cross_context_max_chars)}]`
+        : prompt
+
+      const freshArgs = cliBuilder.buildArgs(null, freshPrompt)
       const freshSandboxed = wrapWithSandbox(
         cliBuilder.command, freshArgs, config.sandbox, config.agent.cwd, config.agent.cli
       )
       await runCliProcess(freshSandboxed, config.agent.cwd, config.agent.timeout, {
         onStdout: handleStdout,
+        onStderr: (text) => { lastStderr = text },
       })
       freshSandboxed.cleanup?.()
     }
@@ -609,7 +627,12 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
     }
     sessions = { ...sessions, [type]: updatedSession }
     saveJson('sessions.json', sessions)
-    console.log(`[cli] ${type} session: ${currentSession.id?.slice(0, 8) ?? 'new'} → ${effectiveSessionId?.slice(0, 8) ?? 'null'} (turn ${updatedSession.turns}${sessionChanged ? ', reset' : ''})`)
+
+    // Detect silent session change (resume returned exit 0 but different session)
+    if (!didRetryFresh && sessionChanged && currentSession.id && effectiveSessionId) {
+      console.error(`[cli] WARNING: ${type} session silently changed: ${currentSession.id.slice(0, 8)} → ${effectiveSessionId.slice(0, 8)} (resume may have failed without error)`)
+    }
+    console.log(`[cli] ${type} session: ${currentSession.id?.slice(0, 8) ?? 'new'} → ${effectiveSessionId?.slice(0, 8) ?? 'null'} (turn ${updatedSession.turns}${didRetryFresh ? ', retry-fresh' : sessionChanged ? ', changed' : ''})`)
 
     // HEARTBEAT_OK suppression
     const finalText = accumulated.trim()
