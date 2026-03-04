@@ -1,0 +1,7 @@
+node_modules/
+dist/
+config.yaml
+data/sessions.json
+data/context.json
+*.sb
+.DS_Store

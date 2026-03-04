@@ -1,0 +1,29 @@
+{
+  "name": "beatclaw",
+  "version": "0.1.0",
+  "description": "Give your CLI a heartbeat",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "beatclaw": "dist/setup.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "setup": "node dist/setup.js"
+  },
+  "keywords": ["claude-code", "codex", "telegram", "mcp", "heartbeat", "agent"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.35.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "yaml": "^2.7.1",
+    "@inquirer/prompts": "^7.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "@types/node": "^22.13.10"
+  }
+}
