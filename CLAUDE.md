@@ -28,7 +28,7 @@ Telegram ← grammY long-polling → Daemon (index.ts) ← MCP SSE (localhost:39
 
 The daemon runs three concurrent subsystems:
 1. **Telegram Bot** (grammY) — message receive/buffer, result streaming
-2. **MCP SSE Server** (`@modelcontextprotocol/sdk`) — exposes `telegram_read`, `telegram_send`, `heartbeat_check` tools to the CLI. Bearer token auth, bound to `127.0.0.1`
+2. **MCP SSE Server** (`@modelcontextprotocol/sdk`) — exposes telegram, todo, memory, and heartbeat tools to the CLI. Bearer token auth, bound to `127.0.0.1`
 3. **Heartbeat Timer** — runs cheap shell checks at configured intervals, spawns CLI only when output is produced
 
 ## Core Data Flow
@@ -94,10 +94,41 @@ Current commands:
 - Immutability — no object/array mutation, create new objects via spread (`messageBuffer = [...messageBuffer, item]`)
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
 
+## Memory System
+
+Semantic memory with two access paths:
+
+- **Passive attach** — at session start, top memories auto-injected into the prompt (no `accessCount` increment). Two pools: 50% recent (`updatedAt` DESC), 50% most accessed (`accessCount` DESC). Budget configurable via `memory.passive_attach_budget` (default 2000 tokens).
+- **Active query** — agent calls `memory_search` MCP tool directly. `accessCount` incremented per result.
+
+### MCP Memory Tools
+
+| Tool | Description |
+|------|-------------|
+| `memory_search(query, tags?)` | Text search + optional tag filter, increments `accessCount` |
+| `memory_save(content, tags?)` | Save memory with auto-compact (merges similar existing memories) |
+| `memory_list(limit?)` | List all memories by most recent |
+| `memory_delete(id)` | Delete a specific memory |
+| `memory_compact()` | Full compaction — merge all similar/duplicate memories |
+
+### Compact Behavior
+
+- **Auto-compact on save**: when saving, if a similar existing memory is found (word overlap + tag overlap >= 0.6 threshold), the new content is merged into the existing memory. Original deleted, only merged result kept.
+- **Manual `memory_compact()`**: scans all memory pairs. Merges all above-threshold pairs. For bulk deduplication.
+
+### Token Estimation
+
+Uses `Buffer.byteLength(text, 'utf-8') / 4` for multilingual safety (handles Korean, CJK characters correctly).
+
+### Data
+
+`data/memories.json` — JSON array of `Memory` objects (`id`, `content`, `tags`, `createdAt`, `updatedAt`, `accessCount`, `estimatedTokens`).
+
 ## Runtime Data
 
 `data/` directory (gitignored):
 - `sessions.json` — session IDs + turn counts (separate user/heartbeat)
 - `context.json` — cross-context sharing (lastUser, lastHeartbeat summaries)
+- `memories.json` — semantic memory store
 - `pending_messages.json` — message backup for crash safety
 - `heartbeat.log`, `heartbeat.error.log` — service logs

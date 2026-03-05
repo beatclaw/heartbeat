@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // src/index.ts — Daemon: telegram + MCP SSE + heartbeat + spawner + streaming
 
-import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, watchFile } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn, exec, execSync, type ChildProcess } from 'node:child_process'
@@ -14,6 +15,7 @@ import { z } from 'zod'
 import { getCliBuilder, type CliBuilder, createActivityExtractor } from './cli.js'
 import { wrapWithSandbox, type SandboxConfig } from './sandbox.js'
 import { loadTodos, addTodo, updateTodo, getNextTodo, clearDone, recoverStuck } from './todos.js'
+import { searchMemories, saveMemory, listMemories, deleteMemory, compactMemories, getPassiveAttach, type MemoryConfig } from './memory.js'
 
 // === Config ===
 
@@ -29,6 +31,7 @@ interface Config {
   telegram: { token: string; default_chat_id: number; allowed_users: number[] }
   heartbeat: { interval: string; checks: string[]; check_timeout: number; prompt: string }
   mcp: { port: number; token: string }
+  memory: MemoryConfig
   sandbox: SandboxConfig
   streaming: { throttle: number; fallback: boolean }
 }
@@ -66,6 +69,7 @@ function loadConfig(): Config {
     ...raw,
     telegram: { ...raw.telegram, token: resolveEnvValue(raw.telegram.token) },
     agent: { ...raw.agent, cwd: raw.agent.cwd.replace(/^~/, homedir()) },
+    memory: { ...{ passive_attach_budget: 2000 }, ...(raw.memory ?? {}) },
   }
 }
 
@@ -107,12 +111,57 @@ function redactSecrets(text: string): string {
 
 // === State ===
 
-const config = loadConfig()
+let config = loadConfig()
 const cliBuilder: CliBuilder = getCliBuilder(config.agent.cli)
+
+function reloadConfig(): { success: boolean; changes: string[] } {
+  const changes: string[] = []
+  try {
+    const prev = config
+    const next = loadConfig()
+
+    if (prev.heartbeat.interval !== next.heartbeat.interval) {
+      changes.push(`heartbeat.interval: ${prev.heartbeat.interval} → ${next.heartbeat.interval}`)
+    }
+    if (prev.heartbeat.prompt !== next.heartbeat.prompt) {
+      changes.push('heartbeat.prompt updated')
+    }
+    if (prev.agent.timeout !== next.agent.timeout) {
+      changes.push(`agent.timeout: ${prev.agent.timeout} → ${next.agent.timeout}`)
+    }
+    if (prev.agent.session_max_turns !== next.agent.session_max_turns) {
+      changes.push(`agent.session_max_turns: ${prev.agent.session_max_turns} → ${next.agent.session_max_turns}`)
+    }
+    if (prev.streaming.throttle !== next.streaming.throttle) {
+      changes.push(`streaming.throttle: ${prev.streaming.throttle} → ${next.streaming.throttle}`)
+    }
+
+    // Telegram token cannot be hot-reloaded (bot already connected)
+    config = { ...next, telegram: { ...next.telegram, token: prev.telegram.token } }
+
+    if (changes.length > 0) {
+      console.log(`[config] Reloaded: ${changes.join(', ')}`)
+    } else {
+      console.log('[config] Reloaded (no changes)')
+    }
+    return { success: true, changes }
+  } catch (err) {
+    console.error('[config] Reload failed:', (err as Error).message)
+    return { success: false, changes: [(err as Error).message] }
+  }
+}
+
+interface PendingAsk {
+  readonly resolve: (answer: string) => void
+  readonly chatId: number
+  readonly messageId: number
+  readonly options: readonly string[]
+}
 
 let messageBuffer: readonly TelegramMessage[] = []
 let isProcessing = false
 let activeChild: ChildProcess | null = null
+const pendingAsks = new Map<string, PendingAsk>()
 
 let sessions: Sessions = loadJson('sessions.json', {
   user: { id: null, turns: 0 },
@@ -143,6 +192,7 @@ bot.command('help', async (ctx) => {
     '/clear — Remove completed todos',
     '/chatid — Show Chat ID / User ID',
     '/stop — Stop current AI task',
+    '/reload — Hot-reload config.yaml',
     '/exit — Shut down the daemon (also: /shutdown, /quit)',
     '',
     'Send any message to trigger the AI agent.',
@@ -207,6 +257,19 @@ bot.command('stop', async (ctx) => {
   await ctx.reply('🛑 <b>Stop</b>\n\nTask terminated.', { parse_mode: 'HTML' })
 })
 
+bot.command('reload', async (ctx) => {
+  if (!ctx.from || !isAllowed(ctx.from.id)) return
+  const result = reloadConfig()
+  if (result.success) {
+    const body = result.changes.length > 0
+      ? result.changes.map(c => `• ${c}`).join('\n')
+      : 'No changes detected.'
+    await ctx.reply(`🔄 <b>Config Reloaded</b>\n\n${body}`, { parse_mode: 'HTML' })
+  } else {
+    await ctx.reply(`❌ <b>Reload Failed</b>\n\n${result.changes[0]}`, { parse_mode: 'HTML' })
+  }
+})
+
 bot.command(['exit', 'shutdown', 'quit'], async (ctx) => {
   if (!ctx.from || !isAllowed(ctx.from.id)) return
   const msg = [
@@ -240,8 +303,45 @@ bot.callbackQuery('exit_cancel', async (ctx) => {
   await ctx.editMessageText('⚠️ <b>Exit</b>\n\nCancelled.', { parse_mode: 'HTML' })
 })
 
+// Handle inline keyboard responses for telegram_ask
+bot.callbackQuery(/^ask_/, async (ctx) => {
+  const data = ctx.callbackQuery.data ?? ''
+  const match = data.match(/^ask_([^_]+)_(\d+)$/)
+  if (!match) return
+
+  const askId = match[1]!
+  const optionIndex = parseInt(match[2]!, 10)
+
+  const pending = pendingAsks.get(askId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: 'Expired' })
+    return
+  }
+
+  const selectedOption = pending.options[optionIndex] ?? `Option ${optionIndex}`
+
+  await ctx.answerCallbackQuery()
+  const originalText = ctx.callbackQuery.message?.text ?? ''
+  await ctx.editMessageText(`${originalText}\n\n✅ ${selectedOption}`)
+
+  pendingAsks.delete(askId)
+  pending.resolve(selectedOption)
+})
+
 bot.on('message:text', async (ctx) => {
   if (!ctx.from || !isAllowed(ctx.from.id)) return
+
+  // Check if this is a force-reply response to a pending telegram_ask
+  const replyToId = ctx.message.reply_to_message?.message_id
+  if (replyToId) {
+    for (const [askId, pending] of pendingAsks) {
+      if (pending.messageId === replyToId && pending.options.length === 0) {
+        pendingAsks.delete(askId)
+        pending.resolve(ctx.message.text)
+        return
+      }
+    }
+  }
 
   messageBuffer = [...messageBuffer, {
     from: ctx.from.first_name ?? 'User',
@@ -275,10 +375,26 @@ async function sendDraft(chatId: number, draftId: string, text: string): Promise
   }
 }
 
+async function sendWithRetry(chatId: number, text: string, retries = 3): Promise<void> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await bot.api.sendMessage(chatId, text)
+      return
+    } catch (err) {
+      const isRetryable = (err as any)?.error?.code === 'ECONNRESET'
+        || (err as any)?.error?.code === 'ETIMEDOUT'
+        || (err as any)?.error?.type === 'system'
+      if (!isRetryable || attempt === retries) throw err
+      console.log(`[telegram] sendMessage retry ${attempt}/${retries} (${(err as any)?.error?.code})`)
+      await new Promise(r => setTimeout(r, 1000 * attempt))
+    }
+  }
+}
+
 async function sendFinalMessage(chatId: number, text: string): Promise<void> {
   const redacted = redactSecrets(text)
   if (redacted.length <= TELEGRAM_MAX_LENGTH) {
-    await bot.api.sendMessage(chatId, redacted)
+    await sendWithRetry(chatId, redacted)
     return
   }
   // Chunk split for long messages
@@ -289,7 +405,7 @@ async function sendFinalMessage(chatId: number, text: string): Promise<void> {
     remaining = remaining.slice(TELEGRAM_MAX_LENGTH)
   }
   for (const chunk of chunks) {
-    await bot.api.sendMessage(chatId, chunk)
+    await sendWithRetry(chatId, chunk)
   }
 }
 
@@ -321,6 +437,39 @@ function createMcpServer(): McpServer {
       const targetChat = chat_id ?? config.telegram.default_chat_id
       await sendFinalMessage(targetChat, text)
       return { content: [{ type: 'text', text: 'Sent.' }] }
+    }
+  )
+
+  server.tool(
+    'telegram_ask',
+    'Ask the user a question via Telegram with optional inline keyboard choices. Waits for the user to respond.',
+    { text: z.string(), options: z.array(z.string()).optional() },
+    async ({ text, options }) => {
+      const askId = randomUUID().slice(0, 8)
+      const chatId = config.telegram.default_chat_id
+
+      const sentMessage = (options && options.length > 0)
+        ? await bot.api.sendMessage(chatId, `❓ ${text}`, {
+            reply_markup: {
+              inline_keyboard: options.map((opt, i) => [
+                { text: opt, callback_data: `ask_${askId}_${i}` },
+              ]),
+            },
+          })
+        : await bot.api.sendMessage(chatId, `❓ ${text}`, {
+            reply_markup: { force_reply: true, selective: false },
+          })
+
+      const answer = await new Promise<string>((resolve) => {
+        pendingAsks.set(askId, {
+          resolve,
+          chatId,
+          messageId: sentMessage.message_id,
+          options: options ?? [],
+        })
+      })
+
+      return { content: [{ type: 'text', text: answer }] }
     }
   )
 
@@ -357,6 +506,13 @@ function createMcpServer(): McpServer {
 
   server.tool('heartbeat_check', 'Run health checks and return results', {}, async () => {
     const results: { command: string; output: string }[] = []
+    if (config.heartbeat.checks.length === 0) {
+      results.push({
+        command: '__config__',
+        output: 'No heartbeat checks configured (heartbeat.checks is empty).',
+      })
+      return { content: [{ type: 'text', text: JSON.stringify(results) }] }
+    }
     for (const cmd of config.heartbeat.checks) {
       try {
         const output = await execShell(cmd, config.agent.cwd)
@@ -369,6 +525,58 @@ function createMcpServer(): McpServer {
     }
     return { content: [{ type: 'text', text: JSON.stringify(results) }] }
   })
+
+  // === Memory tools ===
+
+  server.tool(
+    'memory_search',
+    'Search memories by text query and optional tags. Increments access count for results (active query).',
+    { query: z.string(), tags: z.array(z.string()).optional() },
+    async ({ query, tags }) => {
+      const results = searchMemories(DATA_DIR, query, tags)
+      return { content: [{ type: 'text', text: JSON.stringify(results) }] }
+    }
+  )
+
+  server.tool(
+    'memory_save',
+    'Save a new memory. Auto-compacts with similar existing memories (sync).',
+    { content: z.string(), tags: z.array(z.string()).optional() },
+    async ({ content, tags }) => {
+      const result = saveMemory(DATA_DIR, { content, tags })
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+    }
+  )
+
+  server.tool(
+    'memory_list',
+    'List all memories sorted by most recently updated',
+    { limit: z.number().optional() },
+    async ({ limit }) => {
+      const memories = listMemories(DATA_DIR, limit)
+      return { content: [{ type: 'text', text: JSON.stringify(memories) }] }
+    }
+  )
+
+  server.tool(
+    'memory_delete',
+    'Delete a specific memory by ID',
+    { id: z.string() },
+    async ({ id }) => {
+      const deleted = deleteMemory(DATA_DIR, id)
+      return { content: [{ type: 'text', text: JSON.stringify({ deleted, id }) }] }
+    }
+  )
+
+  server.tool(
+    'memory_compact',
+    'Manually trigger full memory compaction — merges all similar/duplicate memories',
+    {},
+    async () => {
+      const result = compactMemories(DATA_DIR)
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+    }
+  )
 
   return server
 }
@@ -520,7 +728,7 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
     ? messageBuffer[messageBuffer.length - 1]!.message_id
     : null
 
-  // Build prompt with cross-context
+  // Build prompt with cross-context + passive memory attach
   let prompt: string
   if (type === 'user') {
     const messages = messageBuffer.map(m => `[${m.from}]: ${m.text}`).join('\n')
@@ -536,6 +744,12 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
       const truncated = context.lastUser.slice(0, config.agent.cross_context_max_chars)
       prompt += `\n\n---\n[User context (read-only):\n${truncated}]`
     }
+  }
+
+  // Passive memory attach (no access_count increment)
+  const memoryContext = getPassiveAttach(DATA_DIR, config.memory.passive_attach_budget)
+  if (memoryContext) {
+    prompt += `\n\n---\n${memoryContext}`
   }
 
   const args = cliBuilder.buildArgs(currentSession.id, prompt)
@@ -656,7 +870,7 @@ async function spawnCli(type: 'user' | 'heartbeat', chatId?: number): Promise<vo
 
   } catch (err) {
     console.error(`[cli] ${type} spawn error:`, err)
-    await bot.api.sendMessage(targetChat, `Error: ${(err as Error).message}`).catch(() => {})
+    await sendWithRetry(targetChat, `Error: ${(err as Error).message}`).catch(() => {})
   } finally {
     sandboxed.cleanup?.()
     isProcessing = false
@@ -681,8 +895,7 @@ function parseInterval(interval: string): number {
 
 
 function startHeartbeat(): void {
-  const intervalMs = parseInterval(config.heartbeat.interval)
-  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${intervalMs}ms)`)
+  console.log(`[heartbeat] interval: ${config.heartbeat.interval} (${parseInterval(config.heartbeat.interval)}ms)`)
 
   const tick = async () => {
     if (!isProcessing) {
@@ -690,10 +903,12 @@ function startHeartbeat(): void {
       await spawnCli('heartbeat')
     }
 
+    // Re-read interval from config each tick (supports hot-reload)
+    const intervalMs = parseInterval(config.heartbeat.interval)
     setTimeout(tick, intervalMs)
   }
 
-  setTimeout(tick, intervalMs)
+  setTimeout(tick, parseInterval(config.heartbeat.interval))
 }
 
 // === Main ===
@@ -718,6 +933,9 @@ function killExistingDaemon(): void {
 async function main(): Promise<void> {
   killExistingDaemon()
   console.log(`[heartbeat] Starting daemon (cli: ${config.agent.cli}, cwd: ${config.agent.cwd})`)
+  if (config.heartbeat.checks.length === 0) {
+    console.warn('[heartbeat] Warning: heartbeat.checks is empty; heartbeat_check will return a config warning only.')
+  }
 
   // Ensure data directory (mkdirSync recursive is idempotent)
   mkdirSync(DATA_DIR, { recursive: true })
@@ -738,6 +956,21 @@ async function main(): Promise<void> {
 
   bot.catch((err) => {
     console.error('[telegram] Bot error:', err)
+  })
+
+  // Watch config.yaml for changes — auto-reload without restart
+  watchFile(CONFIG_PATH, { interval: 5000 }, (curr, prev) => {
+    if (curr.mtimeMs === prev.mtimeMs) return
+    console.log('[config] File changed, reloading...')
+    const result = reloadConfig()
+    if (result.success && result.changes.length > 0) {
+      const body = result.changes.map(c => `• ${c}`).join('\n')
+      bot.api.sendMessage(
+        config.telegram.default_chat_id,
+        `🔄 <b>Config Hot-Reloaded</b>\n\n${body}`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {})
+    }
   })
 
   bot.start({ onStart: () => console.log('[telegram] Bot started (long-polling)') })

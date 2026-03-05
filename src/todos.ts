@@ -1,6 +1,6 @@
 // src/todos.ts — Todo queue: data model + CRUD + file IO
 
-import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, chmodSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -35,7 +35,9 @@ export function loadTodos(dataDir: string): readonly Todo[] {
 
 function saveTodos(dataDir: string, todos: readonly Todo[]): void {
   const p = filePath(dataDir)
-  writeFileSync(p, JSON.stringify(todos, null, 2), 'utf-8')
+  const tmp = `${p}.tmp`
+  writeFileSync(tmp, JSON.stringify(todos, null, 2), 'utf-8')
+  renameSync(tmp, p)
   chmodSync(p, 0o600)
 }
 

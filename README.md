@@ -116,6 +116,17 @@ Uses Telegram Bot API 9.5 `sendMessageDraft` for real-time streaming:
 - Prompt injection defense depends on CLI's own safeguards
 - sandbox-exec (macOS) only restricts file writes, not reads or network
 
+**Third-party skills/tools warning:**
+- Treat externally sourced skills, prompts, and scripts as untrusted code.
+- Review content before execution, pin trusted sources, and prefer allowlists for automation.
+- Do not run third-party automation with broad filesystem or network permissions by default.
+
+**Troubleshooting `listen EPERM` on localhost:**
+- If you see `listen EPERM ... 127.0.0.1:<port>`, first assume sandbox/session policy, not app logic.
+- Re-run from a normal local shell outside restricted agent sandboxes.
+- Verify a minimal bind test (`node -e "require('net').createServer().listen(<port>,'127.0.0.1')"`).
+- If bind still fails across multiple ports, review host security/runtime policy before debugging app code.
+
 ## Service Management
 
 ```bash
