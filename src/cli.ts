@@ -71,9 +71,9 @@ export class CodexBuilder implements CliBuilder {
 
   buildArgs(sessionId: string | null, prompt: string): string[] {
     if (sessionId) {
-      return ['exec', 'resume', sessionId, prompt, '--full-auto', '--json']
+      return ['exec', 'resume', sessionId, prompt, '--full-auto', '--skip-git-repo-check', '--json']
     }
-    return ['exec', prompt, '--full-auto', '--json']
+    return ['exec', prompt, '--full-auto', '--skip-git-repo-check', '--json']
   }
 
   parseSessionId(output: string): string | null {
@@ -82,9 +82,10 @@ export class CodexBuilder implements CliBuilder {
       if (!trimmed) continue
       try {
         const parsed = JSON.parse(trimmed)
-        // Codex uses thread_id or session_id
-        const id = parsed.thread_id ?? parsed.session_id ?? parsed.id
-        if (typeof id === 'string' && id.length > 0) return id
+        // Codex emits {"type":"thread.started","thread_id":"..."} as the first event
+        if (parsed.type === 'thread.started' && typeof parsed.thread_id === 'string') {
+          return parsed.thread_id
+        }
       } catch {
         // not JSON, skip
       }
@@ -99,15 +100,12 @@ export class CodexBuilder implements CliBuilder {
       if (!trimmed) continue
       try {
         const parsed = JSON.parse(trimmed)
-        if (parsed.type === 'message' && parsed.content) {
-          parts.push(String(parsed.content))
-        }
-        if (parsed.text) {
-          parts.push(String(parsed.text))
+        // item.completed with agent_message contains the response text
+        if (parsed.type === 'item.completed' && parsed.item?.type === 'agent_message' && parsed.item.text) {
+          parts.push(String(parsed.item.text))
         }
       } catch {
-        // plain text fallback
-        parts.push(line)
+        // not JSON — skip (all codex output in --json mode is JSONL)
       }
     }
     return parts.join('')
@@ -205,7 +203,29 @@ function formatToolActivity(name: string, input: Record<string, unknown>): Agent
   return { emoji: null, label }
 }
 
+function createCodexActivityExtractor(): (chunk: string) => AgentActivity | null {
+  return (chunk: string): AgentActivity | null => {
+    for (const line of chunk.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      try {
+        const parsed = JSON.parse(trimmed)
+        if (parsed.type === 'turn.started') {
+          return { emoji: '🤔', label: '🤔 Thinking...' }
+        }
+        if (parsed.type === 'item.completed' && parsed.item?.type === 'tool_use') {
+          return { emoji: '⚡', label: `⚙️ ${short(String(parsed.item.name ?? 'tool'), 40)}` }
+        }
+      } catch {
+        // not JSON, skip
+      }
+    }
+    return null
+  }
+}
+
 export function createActivityExtractor(cliType: string): (chunk: string) => AgentActivity | null {
+  if (cliType === 'codex') return createCodexActivityExtractor()
   if (cliType !== 'claude') return () => null
 
   const blockState = new Map<number, { name: string; inputJson: string }>()
